@@ -1216,16 +1216,46 @@ impl Unparser<'_> {
                     let exprs: Vec<_> = agg
                         .aggr_expr
                         .iter()
-                        .chain(agg.group_expr.iter())
                         .cloned()
-                        .map(|expr| {
+                        .enumerate()
+                        .map(|(idx, expr)| {
+                            let expr = Self::normalize_agg_input_columns(
+                                expr,
+                                agg,
+                                agg_input_has_derived_projection,
+                            )?;
+                            // When this Aggregate is rendered as a derived
+                            // table, an ancestor node (e.g. a Filter that
+                            // couldn't be folded into this SELECT) may
+                            // address this column by the Aggregate schema's
+                            // field name. `expr`'s own default display name
+                            // is not a reliable stand-in for that: it's
+                            // computed from the fully-qualified source
+                            // columns, while the SQL text actually emitted
+                            // for `expr` below has column qualifiers
+                            // stripped/rewritten, so the two can name the
+                            // column differently even though DataFusion
+                            // considers them the same field. Pin the name
+                            // down with an explicit alias so both ends agree.
+                            let expr = if matches!(expr, Expr::Alias(_))
+                                || self.derived_table_depth.get() == 0
+                            {
+                                expr
+                            } else {
+                                let field_name =
+                                    agg.schema.field(agg.group_expr.len() + idx).name();
+                                expr.alias(field_name.clone())
+                            };
+                            self.select_item_to_sql(&expr)
+                        })
+                        .chain(agg.group_expr.iter().cloned().map(|expr| {
                             let expr = Self::normalize_agg_input_columns(
                                 expr,
                                 agg,
                                 agg_input_has_derived_projection,
                             )?;
                             self.select_item_to_sql(&expr)
-                        })
+                        }))
                         .collect::<Result<Vec<_>>>()?;
                     select.projection(exprs);
 
