@@ -346,10 +346,22 @@ impl Unparser<'_> {
                 Ok(true)
             }
             (None, Some(window)) => {
+                let last_window =
+                    window.last().expect("window nodes list must be non-empty");
+                let window_input_has_derived_projection =
+                    Self::contains_projection_before_relation(last_window.input.as_ref());
                 let items = exprs
                     .into_iter()
                     .map(|proj_expr| {
                         let unproj = unproject_window_exprs(proj_expr, &window)?;
+                        let unproj = if window_input_has_derived_projection {
+                            Self::strip_column_qualifiers_for_schema(
+                                unproj,
+                                last_window.input.schema(),
+                            )?
+                        } else {
+                            unproj
+                        };
                         self.select_item_to_sql(&unproj)
                     })
                     .collect::<Result<Vec<_>>>()?;

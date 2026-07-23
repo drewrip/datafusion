@@ -3281,6 +3281,53 @@ fn test_unparse_window_over_derived_aggregate_without_projection() -> Result<()>
     Ok(())
 }
 
+/// Regression test: a window function computed in an outer Projection over
+/// an unaliased GROUP BY Aggregate whose output passes through an
+/// intervening Projection (no SubqueryAlias node in the plan at all). The
+/// unparser must not let the outer Projection/Sort exprs keep the
+/// Aggregate's base-table qualifier once that subtree is rendered as an
+/// alias-less derived table, or the regenerated SQL references a table name
+/// that is out of scope in the outer query.
+#[test]
+fn test_unparse_window_over_projection_over_aggregate_without_subquery_alias(
+) -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("category", DataType::Utf8, false),
+        Field::new("value", DataType::Float64, true),
+    ]);
+    let window_expr = Expr::WindowFunction(Box::new(WindowFunction {
+        fun: WindowFunctionDefinition::AggregateUDF(sum_udaf()),
+        params: WindowFunctionParams {
+            args: vec![col("sum_n")],
+            partition_by: vec![],
+            order_by: vec![],
+            window_frame: WindowFrame::new(None),
+            null_treatment: None,
+            distinct: false,
+            filter: None,
+        },
+    }))
+    .alias("total");
+    let plan = table_scan(Some("t"), &schema, None)?
+        .aggregate(vec![col("category")], vec![sum(col("value")).alias("sum_n")])?
+        .project(vec![col("category"), col("sum_n")])?
+        .window(vec![window_expr])?
+        .project(vec![col("category"), col("sum_n"), col("total")])?
+        .build()?;
+
+    let sql = Unparser::default().plan_to_sql(&plan)?;
+    // The outer SELECT/window must be unqualified (or qualified against an
+    // in-scope alias) since the derived table housing the aggregate has no
+    // alias; only the inner subquery may legitimately still qualify with
+    // `t`, since `t` is in scope there.
+    assert_snapshot!(
+        sql,
+        @r#"SELECT "category", sum_n, sum(sum_n) OVER (ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS total FROM (SELECT t."category", sum(t."value") AS sum_n FROM t GROUP BY t."category")"#
+    );
+
+    Ok(())
+}
+
 #[test]
 fn test_array_to_sql_postgres() -> Result<(), DataFusionError> {
     roundtrip_statement_with_dialect_helper!(
