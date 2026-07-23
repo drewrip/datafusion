@@ -27,6 +27,7 @@ use self::dialect::{DefaultDialect, Dialect};
 use crate::unparser::extension_unparser::UserDefinedLogicalNodeUnparser;
 pub use expr::expr_to_sql;
 pub use plan::plan_to_sql;
+use std::cell::Cell;
 use std::sync::Arc;
 pub mod dialect;
 pub mod extension_unparser;
@@ -58,6 +59,11 @@ pub struct Unparser<'a> {
     dialect: &'a dyn Dialect,
     pretty: bool,
     extension_unparsers: Vec<Arc<dyn UserDefinedLogicalNodeUnparser>>,
+    /// How many `derive()` calls (nested derived-table subqueries) are on
+    /// the stack right now. Zero means the SELECT currently being built is
+    /// the top-level statement; this only tracks recursion depth, so it's
+    /// safe interior-mutable state on an otherwise `&self` API.
+    derived_table_depth: Cell<u32>,
 }
 
 impl<'a> Unparser<'a> {
@@ -66,6 +72,7 @@ impl<'a> Unparser<'a> {
             dialect,
             pretty: false,
             extension_unparsers: vec![],
+            derived_table_depth: Cell::new(0),
         }
     }
 
@@ -136,6 +143,7 @@ impl Default for Unparser<'_> {
             dialect: &DefaultDialect {},
             pretty: false,
             extension_unparsers: vec![],
+            derived_table_depth: Cell::new(0),
         }
     }
 }

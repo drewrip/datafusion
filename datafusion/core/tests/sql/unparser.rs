@@ -339,9 +339,15 @@ async fn optimized_duckdb_unparse_preserves_derived_table_scope() -> Result<()> 
 
     assert!(!sql.contains(r#""o"."__common_expr_1""#));
     assert!(!sql.contains(r#""o"."__common_expr_2""#));
+    // The "products" derived table's own outer projection sits over an
+    // anonymous inner derived table (the one computing `__common_expr_3`),
+    // so `product_id` must be unqualified here - the base-table alias `p`
+    // is only in scope one level deeper, where it's still qualified as
+    // `"p"."product_id"`.
     assert!(sql.contains(
-        r#"ON "oi"."order_id" = "o"."order_id" INNER JOIN (SELECT "p"."product_id""#
+        r#"ON "oi"."order_id" = "o"."order_id" INNER JOIN (SELECT "product_id""#
     ));
+    assert!(sql.contains(r#"FROM (SELECT ("p"."price" - "p"."cost") AS "__common_expr_3", "p"."product_id""#));
 
     Ok(())
 }
@@ -843,6 +849,78 @@ async fn run_roundtrip_tests<F, Fut>(
             errors.join("\n\n---\n\n")
         );
     }
+}
+
+// Synthetic repro of a "join on latest row per group" pattern: a LEFT JOIN
+// whose ON clause filters the right side down to its latest row per group
+// via `row_number() OVER (...) = 1`. Filter pushdown moves that predicate
+// below the join into a Filter directly over the right side's
+// Projection/Window, i.e. Filter -> Projection -> Window. The right side's
+// own FROM clause aliases its base table `m`, so the window's PARTITION BY
+// column gets tagged with that alias by the planner - this qualifier must
+// not leak into an outer scope where `m` isn't in scope.
+const WIDGET_LATEST_SCORE_QUERY: &str = r#"
+select w.category, sum(w.amount) as total_amount,
+    latest.score as latest_score
+from "catalog1"."schema1"."widget_events" w
+left join (select category, score,
+               row_number() over (partition by category order by ts desc) as rn
+           from "catalog1"."schema1"."raw_scores" m) latest
+    on latest.category = w.category and latest.rn = 1
+group by w.category, latest.score
+"#;
+
+fn widget_latest_score_context() -> Result<SessionContext> {
+    let ctx = SessionContext::new();
+
+    let schema_provider = Arc::new(MemorySchemaProvider::new());
+    schema_provider.register_table(
+        "widget_events".to_string(),
+        Arc::new(EmptyTable::new(Arc::new(Schema::new(vec![
+            Field::new("category", DataType::Utf8, false),
+            Field::new("amount", DataType::Float64, true),
+        ])))),
+    )?;
+    schema_provider.register_table(
+        "raw_scores".to_string(),
+        Arc::new(EmptyTable::new(Arc::new(Schema::new(vec![
+            Field::new("category", DataType::Utf8, false),
+            Field::new("ts", DataType::Date32, false),
+            Field::new("score", DataType::Float64, true),
+        ])))),
+    )?;
+
+    let catalog = Arc::new(MemoryCatalogProvider::new());
+    catalog.register_schema("schema1", schema_provider)?;
+    ctx.register_catalog("catalog1", catalog);
+
+    Ok(ctx)
+}
+
+#[tokio::test]
+async fn optimized_duckdb_unparse_join_on_windowed_dedup() -> Result<()> {
+    let ctx = widget_latest_score_context()?;
+    let plan = ctx
+        .sql(WIDGET_LATEST_SCORE_QUERY)
+        .await?
+        .into_optimized_plan()?;
+    println!("WIDGET_LATEST_SCORE optimized plan:\n{}", plan.display_indent());
+    let dialect = DuckDBDialect::new();
+    let unparser = Unparser::new(&dialect);
+    let sql = unparser.plan_to_sql(&plan)?.to_string();
+    println!("WIDGET_LATEST_SCORE unparsed SQL:\n{sql}");
+
+    // The middle SELECT (the one whose FROM is the anonymous derived table
+    // containing the window/base-table alias `m`) must expose `category`
+    // and `score` unqualified - `m` only exists inside that innermost
+    // derived table's own FROM clause, not at this level.
+    assert!(
+        sql.contains(r#"SELECT "category", "score" FROM"#),
+        "middle SELECT should reference category/score unqualified \
+         (the base-table alias `m` is out of scope here): {sql}"
+    );
+
+    Ok(())
 }
 
 #[tokio::test]

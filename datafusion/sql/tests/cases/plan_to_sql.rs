@@ -41,8 +41,9 @@ use datafusion_functions_window::row_number::row_number_udwf;
 use datafusion_sql::planner::{ContextProvider, PlannerContext, SqlToRel};
 use datafusion_sql::unparser::dialect::{
     BigQueryDialect, CustomDialectBuilder, DefaultDialect as UnparserDefaultDialect,
-    DefaultDialect, Dialect as UnparserDialect, MySqlDialect as UnparserMySqlDialect,
-    PostgreSqlDialect as UnparserPostgreSqlDialect, SnowflakeDialect, SqliteDialect,
+    DefaultDialect, Dialect as UnparserDialect, DuckDBDialect,
+    MySqlDialect as UnparserMySqlDialect, PostgreSqlDialect as UnparserPostgreSqlDialect,
+    SnowflakeDialect, SqliteDialect,
 };
 use datafusion_sql::unparser::{Unparser, expr_to_sql, plan_to_sql};
 use insta::assert_snapshot;
@@ -398,7 +399,7 @@ fn roundtrip_statement_with_dialect_5() -> Result<(), DataFusionError> {
         sql: "select j1_id from (select j1_id from j1 limit 10);",
         parser_dialect: MySqlDialect {},
         unparser_dialect: UnparserMySqlDialect {},
-        expected: @"SELECT `j1`.`j1_id` FROM (SELECT `j1`.`j1_id` FROM `j1` LIMIT 10) AS `derived_limit`",
+        expected: @"SELECT `j1_id` FROM (SELECT `j1`.`j1_id` FROM `j1` LIMIT 10) AS `derived_limit`",
     );
     Ok(())
 }
@@ -1527,7 +1528,7 @@ fn test_table_scan_alias() -> Result<()> {
     let table_scan_with_pushdown_all = plan_to_sql(&table_scan_with_pushdown_all)?;
     assert_snapshot!(
         table_scan_with_pushdown_all,
-        @"SELECT a.id FROM (SELECT a.id, a.age FROM t1 AS a WHERE (a.id > 1) LIMIT 10) AS a"
+        @"SELECT id FROM (SELECT a.id, a.age FROM t1 AS a WHERE (a.id > 1) LIMIT 10) AS a"
     );
     Ok(())
 }
@@ -1614,7 +1615,7 @@ fn test_table_scan_pushdown() -> Result<()> {
         plan_to_sql(&query_from_table_scan_with_two_projections)?;
     assert_snapshot!(
         query_from_table_scan_with_two_projections,
-        @"SELECT t1.id, t1.age FROM (SELECT t1.id, t1.age FROM t1)"
+        @"SELECT id, age FROM (SELECT t1.id, t1.age FROM t1)"
     );
 
     let table_scan_with_filter = table_scan_with_filters(
@@ -1791,7 +1792,7 @@ fn test_sort_with_scalar_fn_and_push_down_fetch() -> Result<()> {
     let sql = plan_to_sql(&plan)?;
     assert_snapshot!(
         sql,
-        @"SELECT t1.search_phrase FROM (SELECT t1.search_phrase, t1.event_time FROM t1 WHERE (t1.search_phrase <> '') ORDER BY substr(t1.event_time, 1, 5) ASC NULLS FIRST LIMIT 10)"
+        @"SELECT search_phrase FROM (SELECT t1.search_phrase, t1.event_time FROM t1 WHERE (t1.search_phrase <> '') ORDER BY substr(t1.event_time, 1, 5) ASC NULLS FIRST LIMIT 10)"
     );
     Ok(())
 }
@@ -2191,7 +2192,7 @@ fn test_unnest_to_sql_1() {
     );
     assert_snapshot!(
         statement,
-        @"SELECT UNNEST(unnest_table.array_col) AS u1, unnest_table.struct_col, unnest_table.array_col FROM unnest_table WHERE (unnest_table.array_col <> NULL) ORDER BY unnest_table.struct_col ASC NULLS LAST, unnest_table.array_col ASC NULLS LAST"
+        @"SELECT UNNEST(array_col) AS u1, struct_col, array_col FROM unnest_table WHERE (unnest_table.array_col <> NULL) ORDER BY unnest_table.struct_col ASC NULLS LAST, unnest_table.array_col ASC NULLS LAST"
     );
 }
 
@@ -2384,7 +2385,7 @@ fn test_unparse_extension_to_sql() -> Result<()> {
     let sql = unparser.plan_to_sql(&plan)?;
     assert_snapshot!(
         sql,
-        @"SELECT j1.j1_id AS user_id FROM (SELECT j1.j1_id, j1.j1_string FROM j1)"
+        @"SELECT j1_id AS user_id FROM (SELECT j1.j1_id, j1.j1_string FROM j1)"
     );
 
     if let Some(err) = plan_to_sql(&plan).err() {
@@ -2960,6 +2961,67 @@ fn test_unparse_window() -> Result<()> {
     assert_snapshot!(
         sql,
         @r#"SELECT "k", "v", "rank() PARTITION BY [k] ORDER BY [v ASC NULLS FIRST] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING" FROM (SELECT "k" AS "k", "v" AS "v", rank() OVER (PARTITION BY "k" ORDER BY "v" ASC NULLS FIRST ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS "rank() PARTITION BY [k] ORDER BY [v ASC NULLS FIRST] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING" FROM (SELECT "test"."k" AS "k", "test"."v" AS "v" FROM "test") AS "derived_projection") AS "__qualify_subquery" WHERE ("rank() PARTITION BY [k] ORDER BY [v ASC NULLS FIRST] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING" = 1)"#
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_unparse_filter_on_window_with_projection_between_filter_and_window()
+-> Result<()> {
+    // Reproduces a "latest row per group" pattern:
+    //   SELECT k, v FROM (
+    //     SELECT k, v, row_number() OVER (PARTITION BY k ORDER BY v DESC) AS rn
+    //     FROM test
+    //   ) WHERE rn = 1
+    //
+    // Unlike test_unparse_filter_on_window_over_table_scan, this plan has an
+    // explicit Projection *between* the Filter and the Window node:
+    //   Projection: k, v
+    //     Filter: rn = 1
+    //       Projection: k, v, rn   <-- this is the extra node
+    //         Window: row_number() ...
+    //           TableScan: test
+    let schema = Schema::new(vec![
+        Field::new("k", DataType::Int32, false),
+        Field::new("v", DataType::Int32, false),
+    ]);
+    let window_expr = Expr::WindowFunction(Box::new(WindowFunction {
+        fun: WindowFunctionDefinition::WindowUDF(row_number_udwf()),
+        params: WindowFunctionParams {
+            args: vec![],
+            partition_by: vec![col("k")],
+            order_by: vec![col("v").sort(false, true)],
+            window_frame: WindowFrame::new(None),
+            null_treatment: None,
+            distinct: false,
+            filter: None,
+        },
+    }));
+
+    let table = table_scan(Some("test"), &schema, Some(vec![0, 1]))?.build()?;
+    let window_plan = LogicalPlanBuilder::from(table)
+        .window(vec![window_expr])?
+        .build()?;
+    let rn_name = window_plan.schema().fields().last().unwrap().name().clone();
+
+    let plan = LogicalPlanBuilder::from(window_plan)
+        .project(vec![col("k"), col("v"), col(rn_name.clone())])?
+        .filter(col(rn_name).eq(lit(1i64)))?
+        .project(vec![col("k"), col("v")])?
+        .build()?;
+
+    let dialect = DuckDBDialect::new();
+    let unparser = Unparser::new(&dialect);
+    let sql = unparser.plan_to_sql(&plan)?;
+    // The Projection between the Filter and the Window node must not prevent
+    // reconstructing the window expression into a `QUALIFY` clause. Before
+    // the fix, this rendered the window function's internal, un-aliased
+    // schema_name() as a bare (and non-existent) column identifier in a WHERE
+    // clause, which no real database could bind.
+    assert_snapshot!(
+        sql,
+        @r#"SELECT "k", "v" FROM (SELECT "test"."k", "test"."v", row_number() OVER (PARTITION BY "test"."k" ORDER BY "test"."v" DESC NULLS FIRST ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS "row_number() PARTITION BY [test.k] ORDER BY [test.v DESC NULLS FIRST] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING" FROM "test") WHERE ("row_number() PARTITION BY [test.k] ORDER BY [test.v DESC NULLS FIRST] ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING" = 1)"#
     );
 
     Ok(())

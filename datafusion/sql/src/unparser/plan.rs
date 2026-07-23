@@ -352,7 +352,27 @@ impl Unparser<'_> {
                     Self::contains_projection_before_relation(last_window.input.as_ref());
                 let items = exprs
                     .into_iter()
-                    .map(|proj_expr| {
+                    .enumerate()
+                    .map(|(idx, proj_expr)| {
+                        // If this SELECT item is a bare, unaliased reference
+                        // to the window's output (i.e. `unproject_window_exprs`
+                        // is about to substitute back the raw window
+                        // expression in place of a plain Column), preserve
+                        // the field's declared name as an explicit alias. If
+                        // this Projection itself ends up rendered as a
+                        // derived table (e.g. because an ancestor Filter
+                        // needs to reference this column but couldn't be
+                        // folded into the same SELECT), that name is the only
+                        // way for anything outside this SELECT to address the
+                        // column - the raw expression's own columns may not
+                        // even be in scope out there. Only do this when we're
+                        // actually nested inside a derived table right now -
+                        // at the top level there's no outer scope that could
+                        // need this name, and adding a redundant alias there
+                        // would just be needless roundtrip noise.
+                        let field_name = (self.derived_table_depth.get() > 0
+                            && matches!(proj_expr, Expr::Column(_)))
+                        .then(|| p.schema.field(idx).name().clone());
                         let unproj = unproject_window_exprs(proj_expr, &window)?;
                         let unproj = if window_input_has_derived_projection {
                             Self::strip_column_qualifiers_for_schema(
@@ -362,6 +382,11 @@ impl Unparser<'_> {
                         } else {
                             unproj
                         };
+                        let unproj = match (unproj, field_name) {
+                            (Expr::Column(col), _) => Expr::Column(col),
+                            (unproj, Some(name)) => unproj.alias(name),
+                            (unproj, None) => unproj,
+                        };
                         self.select_item_to_sql(&unproj)
                     })
                     .collect::<Result<Vec<_>>>()?;
@@ -370,6 +395,18 @@ impl Unparser<'_> {
                 Ok(false)
             }
             _ => {
+                // If a Projection (however many hops below, through
+                // single-input nodes like Filter) sits between this
+                // Projection and its relation, that inner Projection will be
+                // rendered as its own derived table. Pass-through columns
+                // here may still carry a qualifier from deep inside that
+                // derived table's own input (e.g. a base-table alias used
+                // several joins down) that is no longer in scope once that
+                // boundary is in place - only the derived table's own output
+                // columns are visible here. Strip such now-invalid
+                // qualifiers, same as the agg/window branches above.
+                let strip_qualifiers =
+                    Self::contains_projection_before_relation(p.input.as_ref());
                 let items = exprs
                     .iter()
                     .map(|e| {
@@ -382,7 +419,15 @@ impl Unparser<'_> {
                         {
                             return Ok(self.build_flatten_value_select_item(alias, None));
                         }
-                        self.select_item_to_sql(e)
+                        let e = if strip_qualifiers {
+                            Self::strip_column_qualifiers_for_schema(
+                                e.clone(),
+                                p.input.schema(),
+                            )?
+                        } else {
+                            e.clone()
+                        };
+                        self.select_item_to_sql(&e)
                     })
                     .collect::<Result<Vec<_>>>()?;
                 select.projection(items);
@@ -448,9 +493,15 @@ impl Unparser<'_> {
         alias: Option<ast::TableAlias>,
         lateral: bool,
     ) -> Result<()> {
+        self.derived_table_depth
+            .set(self.derived_table_depth.get() + 1);
+        let inner_statement_result = self.plan_to_sql(plan);
+        self.derived_table_depth
+            .set(self.derived_table_depth.get() - 1);
+
         let mut derived_builder = DerivedRelationBuilder::default();
         derived_builder.lateral(lateral).alias(alias).subquery({
-            let inner_statement = self.plan_to_sql(plan)?;
+            let inner_statement = inner_statement_result?;
             if let ast::Statement::Query(inner_query) = inner_statement {
                 inner_query
             } else {
